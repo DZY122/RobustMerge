@@ -20,6 +20,7 @@ import shutil
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
 import torch
 from llava.model import *
+from llava.model.svd_tuning import apply_svd_tuning, load_svd_adapters, load_svd_config
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
 
@@ -36,6 +37,17 @@ def clamp(x, min_ratio=0, max_ratio=0):
         max=sorted_x[:, int(d * (1-max_ratio)-1)].unsqueeze(1)
     clamped_x= torch.clamp(x, min, max)
     return clamped_x
+
+
+def _maybe_apply_svd_adapters(model, path):
+    config_path = os.path.join(path, "svd_config.json")
+    if not os.path.exists(config_path):
+        return
+    svd_config = load_svd_config(path)
+    apply_svd_tuning(model, svd_config)
+    if hasattr(model, "config"):
+        model.config.svd_tuning = svd_config.to_dict()
+    load_svd_adapters(model, path)
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
@@ -62,7 +74,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     if 'llava' in model_name.lower():
         # Load LLaVA model
         if 'lora' in model_name.lower() and model_base is None:
-            warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
+            warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading an adapter-based model, please provide the `model_base` argument.')
         if 'lora' in model_name.lower() and model_base is not None:
             from llava.model.language_model.llava_llama import LlavaConfig
             lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
@@ -93,12 +105,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
             model.load_state_dict(non_lora_trainables, strict=False)
             
-            from peft import PeftModel
-            print('Loading LoRA weights...')
-            model = PeftModel.from_pretrained(model, model_path)
-            print('Merging LoRA weights...')
-            model = model.merge_and_unload()
-            print('Model is loaded...')
+            _maybe_apply_svd_adapters(model, model_path)
+            print('Model is loaded with SVD adapters...')
         elif model_base is not None:
             # this may be mm projector only
             print('Loading LLaVA from base model...')
@@ -116,6 +124,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
             mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
             model.load_state_dict(mm_projector_weights, strict=False)
+            _maybe_apply_svd_adapters(model, model_path)
         else:
             if 'mpt' in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
@@ -134,17 +143,14 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                     low_cpu_mem_usage=True,
                     **kwargs
                 )
+            _maybe_apply_svd_adapters(model, model_path)
     else:
         # Load language model
         if model_base is not None:
-            # PEFT model
-            from peft import PeftModel
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             model = AutoModelForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, **kwargs)
-            print(f"Loading LoRA weights from {model_path}")
-            model = PeftModel.from_pretrained(model, model_path)
-            print(f"Merging weights")
-            model = model.merge_and_unload()
+            print(f"Loading adapter weights from {model_path}")
+            _maybe_apply_svd_adapters(model, model_path)
             print('Convert to FP16...')
             model.to(torch.float16)
         else:
@@ -155,6 +161,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             else:
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
                 model = AutoModelForCausalLM.from_pretrained(model_path, low_cpu_mem_usage=True, **kwargs)
+            _maybe_apply_svd_adapters(model, model_path)
 
     image_processor = None
 
