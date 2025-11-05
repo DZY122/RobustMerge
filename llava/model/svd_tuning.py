@@ -128,6 +128,9 @@ def _iterate_named_linears(model: nn.Module):
 def apply_linear_svd_adapters(model: nn.Module, config: SVDLinearConfig) -> List[str]:
     replaced = []
     for parent, child_name, linear in _iterate_named_linears(model):
+        weight = getattr(linear, "weight", None)
+        if weight is None or weight.ndim < 2 or weight.numel() == 0:
+            continue
         adapter = LinearSVDAdapter(linear, config)
         _replace_module(parent, child_name, adapter)
         replaced.append(child_name)
