@@ -150,6 +150,42 @@ def get_non_svd_state_dict(named_params, require_grad_only=True):
     return to_return
 
 
+def _resolve_weight_file(base_path: str, filename: str) -> Optional[str]:
+    if os.path.isdir(base_path):
+        candidate = os.path.join(base_path, filename)
+        if os.path.exists(candidate):
+            return candidate
+    if os.path.isfile(base_path) and os.path.basename(base_path) == filename:
+        return base_path
+
+    try:
+        from huggingface_hub import hf_hub_download  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        return hf_hub_download(repo_id=base_path, filename=filename)
+    except Exception:
+        return None
+
+
+def _load_additional_trainables(model: torch.nn.Module, weight_path: str):
+    non_svd_file = _resolve_weight_file(weight_path, 'non_lora_trainables.bin')
+    if non_svd_file is None:
+        rank0_print(f"No non-SVD trainables found at {weight_path}")
+        return
+
+    state = torch.load(non_svd_file, map_location='cpu')
+    state = {(k[11:] if k.startswith('base_model.') else k): v for k, v in state.items()}
+    if any(k.startswith('model.model.') for k in state):
+        state = {(k[6:] if k.startswith('model.') else k): v for k, v in state.items()}
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        rank0_print(f"Warning: missing keys when loading non-SVD parameters: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+    if unexpected:
+        rank0_print(f"Warning: unexpected keys when loading non-SVD parameters: {unexpected[:5]}{'...' if len(unexpected) > 5 else ''}")
+
+
 def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     to_return = {k: t for k, t in named_params if any(key_match in k for key_match in keys_to_match)}
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
@@ -846,13 +882,29 @@ def train(attn_implementation=None):
         )
         apply_svd_tuning(model, svd_config)
         model.config.svd_tuning = svd_config.to_dict()
-        for name, param in model.named_parameters():
-            param.requires_grad = "svd_" in name
-        if training_args.lora_weight_path:
-            loaded_config = load_svd_config(training_args.lora_weight_path)
+
+        config_source = training_args.lora_weight_path
+        if config_source:
+            weight_locator = config_source if not os.path.isfile(config_source) else os.path.dirname(config_source)
+            try:
+                resolved_config = config_source
+                loaded_config = load_svd_config(config_source)
+            except (OSError, json.JSONDecodeError):
+                resolved_config = _resolve_weight_file(weight_locator, 'svd_config.json')
+                if resolved_config is None:
+                    raise FileNotFoundError(f"Unable to locate svd_config.json under {config_source}")
+                loaded_config = load_svd_config(resolved_config)
             if loaded_config.to_dict() != svd_config.to_dict():
                 rank0_print("Warning: Loaded SVD config does not match training config. Using training config.")
-            load_svd_adapters(model, training_args.lora_weight_path)
+            adapter_source = config_source
+            if not (os.path.isdir(adapter_source) and os.path.exists(os.path.join(adapter_source, 'adapter_model.bin'))):
+                resolved_adapter = _resolve_weight_file(weight_locator, 'adapter_model.bin')
+                if resolved_adapter is not None:
+                    adapter_source = resolved_adapter
+            if not (os.path.isdir(adapter_source) or os.path.isfile(adapter_source)):
+                raise FileNotFoundError(f"Unable to locate adapter_model.bin under {weight_locator}")
+            load_svd_adapters(model, adapter_source)
+            _load_additional_trainables(model, weight_locator)
 
     if 'mpt' in model_args.model_name_or_path:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -923,9 +975,14 @@ def train(attn_implementation=None):
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
     if training_args.lora_enable:
+        extra_trainable = []
+        if model_args.tune_mm_mlp_adapter or training_args.mm_projector_lr is not None:
+            extra_trainable.append('mm_projector')
         for name, param in model.named_parameters():
-            if "svd_" in name:
+            if "svd_" in name or any(token in name for token in extra_trainable):
                 param.requires_grad = True
+            else:
+                param.requires_grad = False
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
