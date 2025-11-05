@@ -40,14 +40,34 @@ def clamp(x, min_ratio=0, max_ratio=0):
 
 
 def _maybe_apply_svd_adapters(model, path):
-    config_path = os.path.join(path, "svd_config.json")
-    if not os.path.exists(config_path):
-        return
-    svd_config = load_svd_config(path)
+    config_source = None
+    adapter_source = None
+    local_config = os.path.join(path, "svd_config.json")
+    local_adapter = os.path.join(path, "adapter_model.bin")
+
+    if os.path.exists(local_config) and os.path.exists(local_adapter):
+        config_source = path
+        adapter_source = path
+    else:
+        try:
+            from huggingface_hub import hf_hub_download
+        except Exception:
+            return
+
+        try:
+            config_file = hf_hub_download(repo_id=path, filename="svd_config.json")
+            adapter_file = hf_hub_download(repo_id=path, filename="adapter_model.bin")
+        except Exception:
+            return
+
+        config_source = config_file
+        adapter_source = adapter_file
+
+    svd_config = load_svd_config(config_source)
     apply_svd_tuning(model, svd_config)
     if hasattr(model, "config"):
         model.config.svd_tuning = svd_config.to_dict()
-    load_svd_adapters(model, path)
+    load_svd_adapters(model, adapter_source)
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}

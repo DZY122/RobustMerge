@@ -222,15 +222,22 @@ def save_svd_adapters(model: nn.Module, save_directory: str, config: SVDLinearCo
         json.dump(config.to_dict(), f)
 
 
-def load_svd_config(load_directory: str) -> SVDLinearConfig:
-    config_path = os.path.join(load_directory, CONFIG_FILENAME)
+def load_svd_config(load_path: str) -> SVDLinearConfig:
+    if os.path.isdir(load_path):
+        config_path = os.path.join(load_path, CONFIG_FILENAME)
+    else:
+        config_path = load_path
     with open(config_path, "r") as f:
         data = json.load(f)
     return SVDLinearConfig.from_dict(data)
 
 
-def load_svd_adapters(model: nn.Module, load_directory: str):
-    state = torch.load(os.path.join(load_directory, ADAPTER_FILENAME), map_location="cpu")
+def load_svd_adapters(model: nn.Module, load_path: str):
+    if os.path.isdir(load_path):
+        state_path = os.path.join(load_path, ADAPTER_FILENAME)
+    else:
+        state_path = load_path
+    state = torch.load(state_path, map_location="cpu")
     for name, param in model.named_parameters():
         if name in state:
             param.data.copy_(state[name].to(param.device, dtype=param.dtype))
