@@ -13,6 +13,7 @@
 #    limitations under the License.
 
 
+import json
 import os, sys
 import warnings
 import shutil
@@ -259,71 +260,93 @@ def load_and_merge_pretrained_model(model_paths, model_base, model_name, save_mo
             warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
         if 'lora' in model_name.lower() and model_base is not None:
             from llava.model.language_model.llava_llama import LlavaConfig
-            
-            model_path = model_paths[0] # loading mm_prejector, just for convenience 
-            lora_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
+
+            model_path = model_paths[0]  # loading mm_projector/config for convenience
+            llava_cfg_pretrained = LlavaConfig.from_pretrained(model_path)
             tokenizer = AutoTokenizer.from_pretrained(model_base, use_fast=False)
             print('Loading LLaVA from base model...')
-            model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=lora_cfg_pretrained, **kwargs)
+            model = LlavaLlamaForCausalLM.from_pretrained(
+                model_base,
+                low_cpu_mem_usage=True,
+                config=llava_cfg_pretrained,
+                **kwargs,
+            )
             token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
             if model.lm_head.weight.shape[0] != token_num:
-                model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
-                model.model.embed_tokens.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
-            
-            print('Loading additional LLaVA weights...')        
-            
-            print('Start saving merged model weights..')
-            coef, mask_ratio, att_ratio = 1/len(model_paths), 0.2, 0.2
-            # 1. merge non-lora weights 
-            merged_non_lora_trainables = {}
+                model.lm_head.weight = torch.nn.Parameter(
+                    torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype)
+                )
+                model.model.embed_tokens.weight = torch.nn.Parameter(
+                    torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype)
+                )
 
-            for i, sub_model_path in enumerate(model_paths):
-                assert os.path.exists(os.path.join(sub_model_path, 'non_lora_trainables.bin')), 'must load from local dir'
-                non_lora_trainables = torch.load(os.path.join(sub_model_path, 'non_lora_trainables.bin'), map_location='cpu')
-                
-                non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
-                if any(k.startswith('model.model.') for k in non_lora_trainables):
-                    non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
-                for name, param in non_lora_trainables.items():
-                    if i==0:
-                        merged_non_lora_trainables[name] = coef * param
+            print('Loading additional LLaVA weights...')
+            os.makedirs(save_model_path, exist_ok=True)
+
+            coef = 1 / len(model_paths)
+            merged_non_svd = {}
+
+            for sub_model_path in model_paths:
+                non_svd_file = _resolve_weight_file(sub_model_path, 'non_lora_trainables.bin')
+                if non_svd_file is None:
+                    raise FileNotFoundError(f"Unable to locate non_lora_trainables.bin under {sub_model_path}")
+                non_svd_trainables = torch.load(non_svd_file, map_location='cpu')
+                non_svd_trainables = {
+                    (k[11:] if k.startswith('base_model.') else k): v for k, v in non_svd_trainables.items()
+                }
+                if any(k.startswith('model.model.') for k in non_svd_trainables):
+                    non_svd_trainables = {
+                        (k[6:] if k.startswith('model.') else k): v for k, v in non_svd_trainables.items()
+                    }
+                for name, param in non_svd_trainables.items():
+                    merged_non_svd[name] = merged_non_svd.get(name, 0) + coef * param
+
+            torch.save(merged_non_svd, os.path.join(save_model_path, 'non_lora_trainables.bin'))
+
+            svd_configs = []
+            for sub_model_path in model_paths:
+                config_file = _resolve_weight_file(sub_model_path, 'svd_config.json')
+                if config_file is None:
+                    raise FileNotFoundError(f"Unable to locate svd_config.json under {sub_model_path}")
+                svd_configs.append(load_svd_config(config_file))
+
+            base_svd_config = svd_configs[0]
+            for idx, cfg in enumerate(svd_configs[1:], start=1):
+                if cfg.to_dict() != base_svd_config.to_dict():
+                    warnings.warn(
+                        f"SVD config mismatch between {model_paths[0]} and {model_paths[idx]}. Using the first config."
+                    )
+                    break
+
+            apply_svd_tuning(model, base_svd_config)
+            model.config.svd_tuning = base_svd_config.to_dict()
+
+            merged_svd_state = {}
+            merged_svd_dtype = {}
+            for sub_model_path in model_paths:
+                adapter_file = _resolve_weight_file(sub_model_path, 'adapter_model.bin')
+                if adapter_file is None:
+                    raise FileNotFoundError(f"Unable to locate adapter_model.bin under {sub_model_path}")
+                svd_state = torch.load(adapter_file, map_location='cpu')
+                for name, tensor in svd_state.items():
+                    tensor_fp32 = tensor.to(torch.float32)
+                    if name not in merged_svd_state:
+                        merged_svd_state[name] = tensor_fp32
+                        merged_svd_dtype[name] = tensor.dtype
                     else:
-                        merged_non_lora_trainables[name] = merged_non_lora_trainables[name] + coef * param
-            torch.save(merged_non_lora_trainables, os.path.join(save_model_path,'non_lora_trainables.bin'))
-            
-            # 2. load, merge and save lora weights (DIR-Merging): prune&scaling and normalization
-            fuse_weight = (torch.ones(len(model_paths))*2.0)[:,None,None]
-            concat_model_weights, merged_model_weights = {}, {}
-            for i, sub_model_path in enumerate(model_paths):
-                lora_parameters = torch.load(os.path.join(sub_model_path, 'adapter_model.bin'), map_location='cpu')
-                for name, param in lora_parameters.items():
-                    if i == 0:
-                        concat_model_weights[name] = param[None,:]
-                    else:
-                        concat_model_weights[name] = torch.concat((concat_model_weights[name],param[None,:]),dim=0)
+                        merged_svd_state[name] += tensor_fp32
 
-            for name, concat_model_weight in concat_model_weights.items():
-                T, d1, d2 = concat_model_weight.shape
-                concat_model_weight = concat_model_weight.reshape(-1, d1*d2)                
+            for name in list(merged_svd_state.keys()):
+                merged_svd_state[name] = (merged_svd_state[name] * coef).to(merged_svd_dtype[name])
 
-                kth_values, _ = concat_model_weight.abs().kthvalue(int(d1 * d2* (1-mask_ratio)), dim=1, keepdim=True)
-                
-                masks = (concat_model_weight.abs() >= kth_values).reshape(T, d1, d2)
-                
-                concat_model_weight = concat_model_weight.reshape(T, d1, d2)
-                trimed_model_weights = masks * concat_model_weight
+            torch.save(merged_svd_state, os.path.join(save_model_path, 'adapter_model.bin'))
+            with open(os.path.join(save_model_path, 'svd_config.json'), 'w') as f:
+                json.dump(base_svd_config.to_dict(), f)
 
-                assert 'lora_A' or 'lora_B' in name, 'not lora components, not implemented yet.'
-                if 'lora_A' in name:
-                    s_vector = torch.sum(abs(concat_model_weight),dim=-1)/ torch.sum(abs(masks * concat_model_weight), dim=-1)
-                    scale = clamp(s_vector, 1-att_ratio, 0)
-                    
-                    merged_model_weights[name]=torch.sum(fuse_weight * trimed_model_weights, dim=0)
-                else: # 'lora_B' in name
-                    merged_model_weights[name]=torch.sum(fuse_weight * scale.unsqueeze(1) * trimed_model_weights, dim=0)/torch.sum(scale.unsqueeze(1), dim=0)
-                    
-            model.config.save_pretrained(save_model_path)
-            torch.save(merged_model_weights, os.path.join(save_model_path,'adapter_model.bin'))
+            for name, param in model.named_parameters():
+                if name in merged_svd_state:
+                    param.data.copy_(merged_svd_state[name].to(param.device, dtype=param.dtype))
+
             print('Finish saving merged model weights.')
 
         elif model_base is not None:
