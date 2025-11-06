@@ -134,20 +134,37 @@ def maybe_zero_3(param, ignore_status=False, name=None):
     return param
 
 
-def get_svd_state_dict(named_params, require_grad_only=True):
-    to_return = {k: t for k, t in named_params if "svd_" in k}
+def _collect_state_dict(named_params, predicate, require_grad_only=True):
+    params = [(k, t) for k, t in named_params if predicate(k, t)]
     if require_grad_only:
-        to_return = {k: t for k, t in to_return.items() if t.requires_grad}
-    to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
-    return to_return
+        params = [(k, t) for k, t in params if t.requires_grad]
+    if not params:
+        return {}
+
+    zero_available = False
+    try:
+        from deepspeed import zero  # type: ignore
+        zero_available = True
+    except Exception:
+        zero_available = False
+
+    if zero_available and any(hasattr(param, "ds_id") for _, param in params):
+        gathered = {}
+        param_list = [param for _, param in params]
+        with zero.GatheredParameters(param_list, modifier_rank=0):
+            for name, param in params:
+                gathered[name] = param.detach().cpu().clone()
+        return gathered
+
+    return {name: param.detach().cpu().clone() for name, param in params}
+
+
+def get_svd_state_dict(named_params, require_grad_only=True):
+    return _collect_state_dict(named_params, lambda name, _: "svd_" in name, require_grad_only)
 
 
 def get_non_svd_state_dict(named_params, require_grad_only=True):
-    to_return = {k: t for k, t in named_params if "svd_" not in k}
-    if require_grad_only:
-        to_return = {k: t for k, t in to_return.items() if t.requires_grad}
-    to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
-    return to_return
+    return _collect_state_dict(named_params, lambda name, _: "svd_" not in name, require_grad_only)
 
 
 def _resolve_weight_file(base_path: str, filename: str) -> Optional[str]:
