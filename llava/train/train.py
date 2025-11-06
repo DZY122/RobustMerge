@@ -34,6 +34,7 @@ from llava.train.llava_trainer import LLaVATrainer
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.model.svd_tuning import (
+    LinearSVDAdapter,
     SVDLinearConfig,
     apply_svd_tuning,
     load_svd_adapters,
@@ -109,7 +110,6 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "How many bits to use."}
     )
     svd_enable: bool = False
-    svd_adapter_dim: Optional[int] = None
     svd_weight_path: str = ""
     svd_num_groups: int = 4
     svd_selected_group: int = 1
@@ -888,15 +888,21 @@ def train(attn_implementation=None):
             if training_args.fp16:
                 model.to(torch.float16)
         rank0_print("Applying SVD-based adapters...")
-        adapter_dim = training_args.svd_adapter_dim
-        if adapter_dim is not None and adapter_dim <= 0:
-            adapter_dim = None
         svd_config = SVDLinearConfig(
             num_groups=training_args.svd_num_groups,
             selected_group=training_args.svd_selected_group,
-            adapter_dim=adapter_dim,
         )
         apply_svd_tuning(model, svd_config)
+        inferred_dim = None
+        for module in model.modules():
+            if isinstance(module, LinearSVDAdapter):
+                inferred_dim = module.adapter_dim
+                break
+        if inferred_dim is not None:
+            rank0_print(
+                f"SVD linear adapter dimension inferred from selected group: {inferred_dim}"
+                f" (≈ min(in_features, out_features) / {training_args.svd_num_groups})"
+            )
         model.config.svd_tuning = svd_config.to_dict()
 
         config_source = training_args.svd_weight_path

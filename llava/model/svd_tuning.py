@@ -20,18 +20,20 @@ class SVDLinearConfig:
     dtype: Optional[torch.dtype] = None
 
     def to_dict(self) -> Dict[str, Optional[int]]:
-        return {
+        data = {
             "num_groups": self.num_groups,
             "selected_group": self.selected_group,
-            "adapter_dim": self.adapter_dim,
         }
+        if self.adapter_dim is not None:
+            data["adapter_dim"] = self.adapter_dim
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Optional[int]]) -> "SVDLinearConfig":
         return cls(
             num_groups=data.get("num_groups", 4),
             selected_group=data.get("selected_group", 1),
-            adapter_dim=data.get("adapter_dim", None),
+            adapter_dim=data.get("adapter_dim"),
         )
 
 
@@ -62,6 +64,8 @@ class LinearSVDAdapter(nn.Module):
         s_slice = s[start:end].contiguous()
         vh_slice = vh[start:end, :].contiguous()
 
+        # Default adapter width equals the size of the selected singular-value group
+        # (i.e. roughly min(in_features, out_features) / num_groups).
         adapter_dim = config.adapter_dim or u_slice.shape[1]
         adapter_dim = min(adapter_dim, u_slice.shape[1])
         if adapter_dim <= 0:
