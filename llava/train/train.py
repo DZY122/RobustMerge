@@ -37,6 +37,7 @@ from llava.model.svd_tuning import (
     LinearSVDAdapter,
     SVDLinearConfig,
     apply_svd_tuning,
+    estimate_svd_num_groups_for_lora_equivalence,
     load_svd_adapters,
     load_svd_config,
 )
@@ -113,6 +114,7 @@ class TrainingArguments(transformers.TrainingArguments):
     svd_weight_path: str = ""
     svd_num_groups: int = 4
     svd_selected_group: int = 1
+    svd_match_lora_rank: Optional[int] = None
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
 
@@ -887,6 +889,16 @@ def train(attn_implementation=None):
                 model.to(torch.bfloat16)
             if training_args.fp16:
                 model.to(torch.float16)
+        if training_args.svd_match_lora_rank is not None:
+            inferred_groups = estimate_svd_num_groups_for_lora_equivalence(
+                model, training_args.svd_match_lora_rank
+            )
+            rank0_print(
+                "Auto-selecting svd_num_groups={} to match LoRA rank {} parameter counts".format(
+                    inferred_groups, training_args.svd_match_lora_rank
+                )
+            )
+            training_args.svd_num_groups = inferred_groups
         rank0_print("Applying SVD-based adapters...")
         svd_config = SVDLinearConfig(
             num_groups=training_args.svd_num_groups,

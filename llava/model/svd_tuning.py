@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import statistics
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -219,6 +221,68 @@ def collect_non_svd_state_dict(model: nn.Module, require_grad_only: bool = True)
             continue
         state[name] = param.detach().cpu()
     return state
+
+
+def estimate_svd_num_groups_for_lora_equivalence(
+    model: nn.Module,
+    lora_rank: int,
+) -> int:
+    """Estimate an SVD group count whose adapter size matches LoRA parameter count.
+
+    Args:
+        model: Model containing linear layers to be adapted.
+        lora_rank: Reference LoRA rank to match parameter counts against.
+
+    Returns:
+        An integer ``num_groups`` whose induced adapter width (roughly
+        ``min(in_features, out_features) / num_groups``) yields a trainable
+        parameter count close to ``lora_rank * (in_features + out_features)``
+        for the median linear layer.
+    """
+
+    if lora_rank <= 0:
+        raise ValueError("lora_rank must be positive when matching parameter counts")
+
+    group_estimates: List[int] = []
+
+    for _, _, linear in _iterate_named_linears(model):
+        weight = getattr(linear, "weight", None)
+        if weight is None or weight.ndim < 2 or weight.numel() == 0:
+            continue
+
+        out_features, in_features = weight.shape[0], weight.shape[1]
+        min_dim = min(out_features, in_features)
+        if min_dim <= 0:
+            continue
+
+        target_params = lora_rank * (out_features + in_features)
+        if target_params <= 0:
+            continue
+
+        ideal_groups = max(min_dim / math.sqrt(float(target_params)), 1.0)
+        candidate_values = {
+            max(int(math.floor(ideal_groups)), 1),
+            max(int(round(ideal_groups)), 1),
+            max(int(math.ceil(ideal_groups)), 1),
+        }
+
+        best_candidate = None
+        best_diff = None
+        for candidate in candidate_values:
+            group_size = max(min_dim // candidate, 1)
+            adapter_params = group_size * group_size
+            diff = abs(adapter_params - target_params)
+            if best_candidate is None or diff < best_diff or (diff == best_diff and candidate < best_candidate):
+                best_candidate = candidate
+                best_diff = diff
+
+        if best_candidate is not None:
+            group_estimates.append(best_candidate)
+
+    if not group_estimates:
+        return 1
+
+    return max(1, int(round(statistics.median(group_estimates))))
 
 
 def save_svd_adapters(model: nn.Module, save_directory: str, config: SVDLinearConfig):
