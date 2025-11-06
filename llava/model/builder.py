@@ -39,6 +39,28 @@ def clamp(x, min_ratio=0, max_ratio=0):
     return clamped_x
 
 
+def _resolve_weight_file(base_path: str, filename: str):
+    """Return a local or remote path for a weight file if it exists."""
+
+    if os.path.isdir(base_path):
+        candidate = os.path.join(base_path, filename)
+        if os.path.exists(candidate):
+            return candidate
+
+    if os.path.isfile(base_path) and os.path.basename(base_path) == filename:
+        return base_path
+
+    try:
+        from huggingface_hub import hf_hub_download  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        return hf_hub_download(repo_id=base_path, filename=filename)
+    except Exception:
+        return None
+
+
 def _maybe_apply_svd_adapters(model, path):
     config_source = None
     adapter_source = None
@@ -49,17 +71,10 @@ def _maybe_apply_svd_adapters(model, path):
         config_source = path
         adapter_source = path
     else:
-        try:
-            from huggingface_hub import hf_hub_download
-        except Exception:
+        config_file = _resolve_weight_file(path, "svd_config.json")
+        adapter_file = _resolve_weight_file(path, "adapter_model.bin")
+        if config_file is None or adapter_file is None:
             return
-
-        try:
-            config_file = hf_hub_download(repo_id=path, filename="svd_config.json")
-            adapter_file = hf_hub_download(repo_id=path, filename="adapter_model.bin")
-        except Exception:
-            return
-
         config_source = config_file
         adapter_source = adapter_file
 
@@ -141,9 +156,16 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
 
-            mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
-            mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
-            model.load_state_dict(mm_projector_weights, strict=False)
+            projector_path = _resolve_weight_file(model_path, 'mm_projector.bin')
+            if projector_path is None:
+                warnings.warn(
+                    f"mm_projector.bin not found under {model_path}. "
+                    "Continuing without loading projector weights."
+                )
+            else:
+                mm_projector_weights = torch.load(projector_path, map_location='cpu')
+                mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
+                model.load_state_dict(mm_projector_weights, strict=False)
             _maybe_apply_svd_adapters(model, model_path)
         else:
             if 'mpt' in model_name.lower():
