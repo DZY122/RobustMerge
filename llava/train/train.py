@@ -153,12 +153,18 @@ def _collect_state_dict(named_params, predicate, require_grad_only=True):
         if ds_params:
             gathered = {}
 
+            dist = getattr(torch, "distributed", None)
+            should_store = True
+            if dist is not None and dist.is_available() and dist.is_initialized():
+                should_store = dist.get_rank() == 0
+
             def _gather_chunk(chunk):
                 if not chunk:
                     return
                 with zero.GatheredParameters([p for _, p in chunk], modifier_rank=0):
-                    for name, param in chunk:
-                        gathered[name] = param.detach().cpu().clone()
+                    if should_store:
+                        for name, param in chunk:
+                            gathered[name] = param.detach().cpu().clone()
 
             max_chunk_bytes = 256 * 1024 * 1024  # 256MB
             current_chunk = []
@@ -172,9 +178,11 @@ def _collect_state_dict(named_params, predicate, require_grad_only=True):
                     current_size = 0
             _gather_chunk(current_chunk)
 
-            for name, param in non_ds_params:
-                gathered[name] = param.detach().cpu().clone()
-            return gathered
+            if should_store:
+                for name, param in non_ds_params:
+                    gathered[name] = param.detach().cpu().clone()
+                return gathered
+            return {}
 
     return {name: param.detach().cpu().clone() for name, param in params}
 
@@ -1055,15 +1063,16 @@ def train(attn_implementation=None):
     model.config.use_cache = True
 
     if training_args.svd_enable:
+        svd_state = get_svd_state_dict(model.named_parameters())
+        non_svd_state = get_non_svd_state_dict(model.named_parameters())
+
         if training_args.local_rank == 0 or training_args.local_rank == -1:
             model.config.save_pretrained(training_args.output_dir)
             svd_config = SVDLinearConfig.from_dict(model.config.svd_tuning)
             os.makedirs(training_args.output_dir, exist_ok=True)
-            svd_state = get_svd_state_dict(model.named_parameters())
             torch.save(svd_state, os.path.join(training_args.output_dir, 'adapter_model.bin'))
             with open(os.path.join(training_args.output_dir, 'svd_config.json'), 'w') as f:
                 json.dump(svd_config.to_dict(), f)
-            non_svd_state = get_non_svd_state_dict(model.named_parameters())
             torch.save(non_svd_state, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
             generation_config = getattr(model, "generation_config", None)
             if generation_config is not None:
