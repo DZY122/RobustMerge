@@ -1,7 +1,7 @@
 #!/bin/bash
 
 deepspeed llava/train/train_mem.py \
-    --lora_enable True --lora_r 128 --svd_num_groups 4 --svd_selected_group 1 --mm_projector_lr 2e-5 \
+    --svd_enable True --svd_adapter_dim 128 --svd_num_groups 4 --svd_selected_group 1 --mm_projector_lr 2e-5 \
     --deepspeed ./scripts/zero3.json \
     --model_name_or_path liuhaotian/llava-v1.5-13b \
     --version v1 \

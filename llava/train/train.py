@@ -108,12 +108,9 @@ class TrainingArguments(transformers.TrainingArguments):
         default=16,
         metadata={"help": "How many bits to use."}
     )
-    lora_enable: bool = False
-    lora_r: int = 64
-    lora_alpha: int = 16
-    lora_dropout: float = 0.05
-    lora_weight_path: str = ""
-    lora_bias: str = "none"
+    svd_enable: bool = False
+    svd_adapter_dim: Optional[int] = None
+    svd_weight_path: str = ""
     svd_num_groups: int = 4
     svd_selected_group: int = 1
     mm_projector_lr: Optional[float] = None
@@ -884,14 +881,16 @@ def train(attn_implementation=None):
                 output.requires_grad_(True)
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
-    if training_args.lora_enable:
+    if training_args.svd_enable:
         if training_args.bits == 16:
             if training_args.bf16:
                 model.to(torch.bfloat16)
             if training_args.fp16:
                 model.to(torch.float16)
         rank0_print("Applying SVD-based adapters...")
-        adapter_dim = training_args.lora_r if training_args.lora_r > 0 else None
+        adapter_dim = training_args.svd_adapter_dim
+        if adapter_dim is not None and adapter_dim <= 0:
+            adapter_dim = None
         svd_config = SVDLinearConfig(
             num_groups=training_args.svd_num_groups,
             selected_group=training_args.svd_selected_group,
@@ -900,7 +899,7 @@ def train(attn_implementation=None):
         apply_svd_tuning(model, svd_config)
         model.config.svd_tuning = svd_config.to_dict()
 
-        config_source = training_args.lora_weight_path
+        config_source = training_args.svd_weight_path
         if config_source:
             weight_locator = config_source if not os.path.isfile(config_source) else os.path.dirname(config_source)
             try:
@@ -991,7 +990,7 @@ def train(attn_implementation=None):
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
 
-    if training_args.lora_enable:
+    if training_args.svd_enable:
         extra_trainable = []
         if model_args.tune_mm_mlp_adapter or training_args.mm_projector_lr is not None:
             extra_trainable.append('mm_projector')
@@ -1016,7 +1015,7 @@ def train(attn_implementation=None):
 
     model.config.use_cache = True
 
-    if training_args.lora_enable:
+    if training_args.svd_enable:
         if training_args.local_rank == 0 or training_args.local_rank == -1:
             model.config.save_pretrained(training_args.output_dir)
             svd_config = SVDLinearConfig.from_dict(model.config.svd_tuning)
