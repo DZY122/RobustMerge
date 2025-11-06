@@ -147,13 +147,34 @@ def _collect_state_dict(named_params, predicate, require_grad_only=True):
     except Exception:
         zero_available = False
 
-    if zero_available and any(hasattr(param, "ds_id") for _, param in params):
-        gathered = {}
-        param_list = [param for _, param in params]
-        with zero.GatheredParameters(param_list, modifier_rank=0):
-            for name, param in params:
+    if zero_available:
+        ds_params = [(name, param) for name, param in params if hasattr(param, "ds_id")]
+        non_ds_params = [(name, param) for name, param in params if not hasattr(param, "ds_id")]
+        if ds_params:
+            gathered = {}
+
+            def _gather_chunk(chunk):
+                if not chunk:
+                    return
+                with zero.GatheredParameters([p for _, p in chunk], modifier_rank=0):
+                    for name, param in chunk:
+                        gathered[name] = param.detach().cpu().clone()
+
+            max_chunk_bytes = 256 * 1024 * 1024  # 256MB
+            current_chunk = []
+            current_size = 0
+            for name, param in ds_params:
+                current_chunk.append((name, param))
+                current_size += param.numel() * param.element_size()
+                if current_size >= max_chunk_bytes:
+                    _gather_chunk(current_chunk)
+                    current_chunk = []
+                    current_size = 0
+            _gather_chunk(current_chunk)
+
+            for name, param in non_ds_params:
                 gathered[name] = param.detach().cpu().clone()
-        return gathered
+            return gathered
 
     return {name: param.detach().cpu().clone() for name, param in params}
 
@@ -1044,6 +1065,12 @@ def train(attn_implementation=None):
                 json.dump(svd_config.to_dict(), f)
             non_svd_state = get_non_svd_state_dict(model.named_parameters())
             torch.save(non_svd_state, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
+            generation_config = getattr(model, "generation_config", None)
+            if generation_config is not None:
+                try:
+                    generation_config.save_pretrained(training_args.output_dir)
+                except Exception as exc:
+                    rank0_print(f"Warning: failed to save generation config: {exc}")
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
