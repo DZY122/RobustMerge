@@ -8,12 +8,13 @@ GPU=$2
 
 RESULT_DIR="./results/ScienceQA"
 echo $RESULT_DIR
+mkdir -p "$RESULT_DIR"
 
 CUDA_VISIBLE_DEVICES=$GPU python -m llava.eval.model_vqa_science \
     --model-path $MODELPATH \
     --model-base models/llava-v1.5-7b \
-    --question-file instructions/ScienceQA/test.json \
-    --image-folder datasets \
+    --question-file instructions/Seen_data/ScienceQA/test.json \
+    --image-folder datasets/Seen_data \
     --answers-file $RESULT_DIR/${CHUNKS}_${IDX}.jsonl \
     --num-chunks $CHUNKS \
     --chunk-idx $IDX \
@@ -33,7 +34,7 @@ for IDX in $(seq 0 $((CHUNKS-1))); do
 done
 
 python llava/eval/eval_science_qa.py \
-    --base-dir  datasets/ScienceQA/ \
+    --base-dir  datasets/Seen_data/ScienceQA/ \
     --result-file $output_file \
     --output-file $RESULT_DIR/output.jsonl \
     --output-result $RESULT_DIR/output_result.jsonl \

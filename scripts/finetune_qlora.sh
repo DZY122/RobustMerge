@@ -16,7 +16,7 @@
 
 deepspeed llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
-    --lora_enable True \
+    --svd_enable True \
     --bits 4 \
     --model_name_or_path ./checkpoints/$MODEL_VERSION \
     --version $PROMPT_VERSION \
